@@ -78,14 +78,14 @@ class NMT(nn.Module):
 
         self.post_embed_cnn = nn.Conv1d(kernel_size=2, in_channels=embed_size, out_channels=embed_size, padding='same')
         self.encoder = nn.LSTM(bidirectional=True, bias=True, input_size=embed_size, hidden_size=hidden_size)
-        self.decoder = nn.LSTMCell(input_size=hidden_size, hidden_size=hidden_size)
+        self.decoder = nn.LSTMCell(input_size=embed_size+hidden_size, hidden_size=hidden_size, bias=True)
 
         self.h_projection = nn.Linear(bias=False, in_features=2*hidden_size, out_features=hidden_size)
         self.c_projection = nn.Linear(bias=False, in_features=2*hidden_size, out_features=hidden_size)
         self.att_projection = nn.Linear(bias=False, in_features=2*hidden_size, out_features=hidden_size)
         self.combined_output_projection = nn.Linear(bias=False, in_features=3*hidden_size, out_features=hidden_size)
         self.target_vocab_projection = nn.Linear(bias=False, in_features=hidden_size, out_features=self.target_vocab_size)
-        self.dropout = nn.Dropout()
+        self.dropout = nn.Dropout(self.dropout_rate)
 
         ### Use the following docs to properly initialize these variables:
         ###     LSTM:
@@ -293,8 +293,14 @@ class NMT(nn.Module):
         ###         which should be shape (b, src_len, h),
         ###         where b = batch size, src_len = maximum source length, h = hidden size.
         ###         This is applying W_{attProj} to h^enc, as described in the PDF.
+
+        enc_hiddens_proj = self.att_projection(enc_hiddens)
         ###     2. Construct tensor `Y` of target sentences with shape (tgt_len, b, e) using the target model embeddings.
         ###         where tgt_len = maximum target sentence length, b = batch size, e = embedding size.
+
+        # tgt_len, b, e
+        Y = self.model_embeddings.target(target_padded)
+
         ###     3. Use the torch.split function to iterate over the time dimension of Y.
         ###         Within the loop, this will give you Y_t of shape (1, b, e) where b = batch size, e = embedding size.
         ###             - Squeeze Y_t into a tensor of dimension (b, e).
@@ -303,6 +309,16 @@ class NMT(nn.Module):
         ###               as well as the new combined output o_t.
         ###             - Append o_t to combined_outputs
         ###             - Update o_prev to the new o_t.
+
+        for Y_t in torch.split(Y, 1, dim=0):
+            Y_t = Y_t.squeeze(dim=0)
+            Ybar_t = torch.concat((Y_t, o_prev), dim=1)
+            dec_state, o_t, _ = self.step(Ybar_t, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
+            combined_outputs.append(o_t)
+            o_prev = o_t
+
+        combined_outputs = torch.stack(combined_outputs)
+
         ###     4. Use torch.stack to convert combined_outputs from a list length tgt_len of
         ###         tensors shape (b, h), to a single tensor shape (tgt_len, b, h)
         ###         where tgt_len = maximum target sentence length, b = batch size, h = hidden size.
@@ -322,9 +338,6 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tensor Stacking:
         ###         https://pytorch.org/docs/stable/torch.html#torch.stack
-
-
-
         ### END YOUR CODE
 
         return combined_outputs
@@ -360,6 +373,20 @@ class NMT(nn.Module):
 
         ### YOUR CODE HERE (~3 Lines)
         ### TODO:
+        # b, e+h
+        #print(f'Ybar_t is of shape {Ybar_t.shape}.')
+
+        # b,h and b,h   (b=5, e=3, h=2)
+        dec_state = self.decoder(Ybar_t, dec_state)
+
+        dec_hidden, dec_cell = dec_state
+
+        #print(f'enc_hiddens_proj is of shape {enc_hiddens_proj.shape}[b , src_len, h]')
+
+        e_t = torch.bmm(enc_hiddens_proj, dec_hidden.unsqueeze(dim=2)).squeeze(dim=2)
+
+        #print(f'e_t is of shape {e_t.shape}[b,src_len]')
+
         ###     1. Apply the decoder to `Ybar_t` and `dec_state`to obtain the new dec_state.
         ###     2. Split dec_state into its two parts (dec_hidden, dec_cell)
         ###     3. Compute the attention scores e_t, a Tensor shape (b, src_len).
@@ -376,7 +403,9 @@ class NMT(nn.Module):
         ### Use the following docs to implement this functionality:
         ###     Batch Multiplication:
         ###        https://pytorch.org/docs/stable/torch.html#torch.bmm
-        ###     Tensor Unsqueeze:
+        #iddens_proj, dec_hidden.unsqueeze(dim=2)).squeeze(dim=2)
+
+        #print(f'e_t is of shape {e_t.shape}')
         ###         https://pytorch.org/docs/stable/torch.html#torch.unsqueeze
         ###     Tensor Squeeze:
         ###         https://pytorch.org/docs/stable/torch.html#torch.squeeze
@@ -394,12 +423,32 @@ class NMT(nn.Module):
         ###     2. Use batched matrix multiplication between alpha_t and enc_hiddens to obtain the
         ###         attention output vector, a_t.
         # $$     Hints:
-        ###           - alpha_t is shape (b, src_len)
-        ###           - enc_hiddens is shape (b, src_len, 2h)
-        ###           - a_t should be shape (b, 2h)
-        ###           - You will need to do some squeezing and unsqueezing.
-        ###     Note: b = batch size, src_len = maximum source length, h = hidden size.
-        ###
+
+        # [b , src_len]
+        alpha_t = nn.functional.softmax(e_t, dim=1)
+
+        # [b, 1, src_len]
+        alpha_t = alpha_t.unsqueeze(dim=1)
+
+        # enc_hiddens: [b, src_len, 2*h]
+        # a_t: [b, 2h]
+        a_t = torch.bmm(alpha_t, enc_hiddens).squeeze(dim=1)
+
+        u_t = torch.concat((dec_hidden, a_t), dim=1)
+
+        #print(f'a_t is of shape {a_t.shape} and u_t is of shape {u_t.shape}')
+
+        v_t = self.combined_output_projection(u_t)
+
+        #print(f'v_t is of shape {v_t.shape}')
+        O_t = self.dropout(torch.tanh(v_t))
+
+
+        ### - alpha_t is shape (b, src_len)
+        ### - enc_hiddens is shape (b, src_len, 2h)
+        ### - a_t should be shape (b, 2h)
+        ### - You will need to do some squeezing and unsqueezing.
+        ### Note: b = batch size, src_len = maximum source length, h = hidden size.
         ###     3. Concatenate dec_hidden with a_t to compute tensor U_t
         ###     4. Apply the combined output projection layer to U_t to compute tensor V_t
         ###     5. Compute tensor O_t by first applying the Tanh function and then the dropout layer.
